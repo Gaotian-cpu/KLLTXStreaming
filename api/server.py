@@ -15,6 +15,7 @@ LTX Streaming Service — HTTP API
 from __future__ import annotations
 
 import io
+import os
 import sys
 from pathlib import Path
 from typing import Optional
