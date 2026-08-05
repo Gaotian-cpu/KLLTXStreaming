@@ -17,6 +17,7 @@ from __future__ import annotations
 import io
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -88,9 +89,18 @@ task_manager = TaskManager(
 )
 
 
+_engine = None
+_engine_lock = threading.Lock()
+
+
 def _engine_factory() -> StreamingEngine:
     # 每个任务可以新建引擎；大模型场景下也可改成单例 + 锁
-    return StreamingEngine(cfg)
+    # 避免显存被每一个调用搞崩
+    global _engine
+    with _engine_lock:
+        if _engine is None:
+            _engine = StreamingEngine(cfg)
+        return _engine
 
 
 task_manager.set_engine_factory(_engine_factory)
