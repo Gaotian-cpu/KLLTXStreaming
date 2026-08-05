@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <title>LTX Stream Player</title>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.7/dist/hls.min.js"></script>
+    <style>
+        body { margin: 0; background: #111; color: #eee; font-family: system-ui, sans-serif; }
+        .wrap { max-width: 960px; margin: 24px auto; padding: 0 12px; }
+        video { width: 100%; background: #000; border-radius: 8px; aspect-ratio: 16/9; }
+        .meta { margin-top: 12px; font-size: 14px; opacity: 0.85; word-break: break-all; }
+        code { background: #222; padding: 2px 6px; border-radius: 4px; }
+        a { color: #7c9cff; }
+    </style>
+</head>
+<body>
+<div class="wrap">
+    <h2>LTX Streaming Player</h2>
+    <video id="v" controls autoplay muted playsinline></video>
+    <div class="meta">
+        <div>Task: <code id="taskId">—</code></div>
+        <div>Status: <code id="st">—</code></div>
+        <div>Stream: <code id="stream">—</code></div>
+        <div style="margin-top:8px"><a href="/">← 返回控制台</a></div>
+    </div>
+</div>
+<script>
+    // 从路径 /player/{task_id} 解析
+    const parts = location.pathname.split("/").filter(Boolean);
+    const taskId = parts[parts.length - 1] || "";
+    const streamUrl = location.origin + "/streams/" + taskId + "/playlist.m3u8";
+
+    document.getElementById("taskId").textContent = taskId || "(missing)";
+    document.getElementById("stream").textContent = streamUrl;
+
+    const video = document.getElementById("v");
+    let hls = null;
+
+    function startPlay() {
+        if (!taskId || taskId === "player") {
+            document.getElementById("st").textContent = "invalid task_id";
+            return;
+        }
+        if (window.Hls && Hls.isSupported()) {
+            hls = new Hls({ enableWorker: true, lowLatencyMode: true, liveDurationInfinity: true });
+            hls.loadSource(streamUrl);
+            hls.attachMedia(video);
+            hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
+            hls.on(Hls.Events.ERROR, (_, data) => {
+                if (data.fatal) setTimeout(() => { if (hls) hls.loadSource(streamUrl); }, 2000);
+            });
+        } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+            video.src = streamUrl;
+            video.addEventListener("loadedmetadata", () => video.play().catch(() => {}), { once: true });
+        }
+    }
+
+    async function pollStatus() {
+        if (!taskId) return;
+        try {
+            const r = await fetch("/api/v1/tasks/" + taskId);
+            if (!r.ok) return;
+            const j = await r.json();
+            document.getElementById("st").textContent = j.status || "?";
+        } catch (e) {}
+    }
+
+    startPlay();
+    pollStatus();
+    setInterval(pollStatus, 3000);
+</script>
+</body>
+</html>

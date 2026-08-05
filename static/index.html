@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <title>LTX Streaming Console</title>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.7/dist/hls.min.js"></script>
+    <style>
+        :root {
+            --bg: #0f1115; --card: #1a1d24; --border: #2a2f3a;
+            --text: #e8eaed; --muted: #9aa0a6; --accent: #7c9cff; --ok: #3dd68c; --warn: #f5a524;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0; font-family: system-ui, -apple-system, sans-serif;
+            background: var(--bg); color: var(--text); line-height: 1.5;
+        }
+        .wrap { max-width: 960px; margin: 0 auto; padding: 24px 16px 48px; }
+        h1 { font-size: 1.35rem; margin: 0 0 4px; }
+        .sub { color: var(--muted); font-size: 0.9rem; margin-bottom: 20px; }
+        .card {
+            background: var(--card); border: 1px solid var(--border);
+            border-radius: 12px; padding: 16px 18px; margin-bottom: 16px;
+        }
+        label { display: block; font-size: 0.85rem; color: var(--muted); margin: 10px 0 4px; }
+        input[type=text], input[type=number], textarea {
+            width: 100%; padding: 10px 12px; border-radius: 8px;
+            border: 1px solid var(--border); background: #12151b; color: var(--text);
+            font: inherit;
+        }
+        textarea { min-height: 88px; resize: vertical; }
+        .row { display: flex; gap: 12px; flex-wrap: wrap; }
+        .row > div { flex: 1; min-width: 120px; }
+        button {
+            margin-top: 14px; padding: 10px 18px; border: none; border-radius: 8px;
+            background: var(--accent); color: #0b0d12; font-weight: 600;
+            cursor: pointer; font-size: 0.95rem;
+        }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        button.secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
+        video { width: 100%; background: #000; border-radius: 10px; aspect-ratio: 16/9; }
+        .meta { font-size: 0.85rem; color: var(--muted); margin-top: 10px; word-break: break-all; }
+        .meta strong { color: var(--text); }
+        .status-pill {
+            display: inline-block; padding: 2px 10px; border-radius: 999px;
+            font-size: 0.8rem; font-weight: 600; background: #2a2f3a;
+        }
+        .status-pill.streaming, .status-pill.completed { background: #143528; color: var(--ok); }
+        .status-pill.failed, .status-pill.cancelled { background: #3a1a1a; color: #ff8a8a; }
+        .status-pill.running, .status-pill.pending { background: #3a2e14; color: var(--warn); }
+        .log {
+            font-family: ui-monospace, monospace; font-size: 0.78rem;
+            max-height: 140px; overflow: auto; color: var(--muted);
+            white-space: pre-wrap; margin-top: 8px;
+        }
+        a { color: var(--accent); }
+    </style>
+</head>
+<body>
+<div class="wrap">
+    <h1>LTX Streaming Console</h1>
+    <p class="sub">提交任务 → 自动轮询 → 有流即播放</p>
+
+    <div class="card">
+        <form id="form">
+            <label>提示词 prompt *</label>
+            <textarea id="prompt" required placeholder="A young woman looking at the camera, soft smile, cinematic lighting"></textarea>
+
+            <label>初始图片（可选，I2V）</label>
+            <input type="file" id="image" accept="image/*"/>
+
+            <div class="row">
+                <div>
+                    <label>分片时长（秒）</label>
+                    <input type="number" id="segment_duration" value="3" min="1" max="10" step="0.5"/>
+                </div>
+                <div>
+                    <label>最大分片数</label>
+                    <input type="number" id="max_chunks" value="10" min="1" max="120"/>
+                </div>
+                <div>
+                    <label>宽（可选）</label>
+                    <input type="number" id="width" placeholder="默认"/>
+                </div>
+                <div>
+                    <label>高（可选）</label>
+                    <input type="number" id="height" placeholder="默认"/>
+                </div>
+            </div>
+
+            <button type="submit" id="btnSubmit">提交任务</button>
+            <button type="button" class="secondary" id="btnStop" disabled>停止轮询</button>
+        </form>
+    </div>
+
+    <div class="card">
+        <div>
+            状态：
+            <span class="status-pill" id="status">idle</span>
+            &nbsp; task_id：<strong id="taskId">—</strong>
+        </div>
+        <div class="meta">
+            progress: <strong id="progress">—</strong>
+            · segments: <strong id="segments">—</strong>
+            · <a id="playerLink" href="#" target="_blank" style="display:none">独立播放页</a>
+        </div>
+        <div class="meta" id="streamUrl"></div>
+        <div class="log" id="log"></div>
+    </div>
+
+    <div class="card">
+        <video id="video" controls playsinline muted></video>
+    </div>
+</div>
+
+<script>
+    // 与当前站点同源，走相对路径即可
+    const BASE = "";
+    const $ = (id) => document.getElementById(id);
+    let pollTimer = null;
+    let hls = null;
+    let currentTaskId = null;
+    let streamStarted = false;
+
+    function log(msg) {
+        const el = $("log");
+        const t = new Date().toLocaleTimeString();
+        el.textContent = `[${t}] ${msg}\n` + el.textContent;
+    }
+
+    function setStatus(s) {
+        const el = $("status");
+        el.textContent = s;
+        el.className = "status-pill " + s;
+    }
+
+    function stopPoll() {
+        if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+        $("btnStop").disabled = true;
+    }
+
+    function destroyHls() {
+        if (hls) { hls.destroy(); hls = null; }
+        streamStarted = false;
+    }
+
+    function playStream(url) {
+        const video = $("video");
+        if (streamStarted && video.dataset.src === url) return;
+        destroyHls();
+        video.dataset.src = url;
+        streamStarted = true;
+        log("开始播放: " + url);
+
+        if (window.Hls && Hls.isSupported()) {
+            hls = new Hls({ enableWorker: true, lowLatencyMode: true, liveDurationInfinity: true });
+            hls.loadSource(url);
+            hls.attachMedia(video);
+            hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                video.play().catch(() => {});
+            });
+            hls.on(Hls.Events.ERROR, (_, data) => {
+                if (data.fatal) {
+                    log("HLS 错误，2s 后重试: " + (data.type || ""));
+                    setTimeout(() => { if (hls) hls.loadSource(url); }, 2000);
+                }
+            });
+        } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+            video.src = url;
+            video.addEventListener("loadedmetadata", () => video.play().catch(() => {}), { once: true });
+        } else {
+            log("当前浏览器不支持 HLS，请打开独立播放页或换 Chrome/Safari");
+        }
+    }
+
+    async function pollOnce() {
+        if (!currentTaskId) return;
+        try {
+            const r = await fetch(BASE + "/api/v1/tasks/" + currentTaskId);
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            const j = await r.json();
+            setStatus(j.status || "?");
+            $("progress").textContent = (j.progress != null) ? j.progress : "—";
+            $("segments").textContent = (j.segment_count != null) ? j.segment_count : "—";
+
+            if (j.stream_url) {
+                $("streamUrl").innerHTML = 'stream: <a href="' + j.stream_url + '" target="_blank">' + j.stream_url + "</a>";
+                playStream(j.stream_url);
+            }
+            if (j.player_url) {
+                const a = $("playerLink");
+                a.href = j.player_url;
+                a.style.display = "inline";
+            }
+            if (j.error) log("error: " + j.error);
+
+            if (["completed", "failed", "cancelled"].includes(j.status)) {
+                log("任务结束: " + j.status);
+                stopPoll();
+                $("btnSubmit").disabled = false;
+            }
+        } catch (e) {
+            log("轮询失败: " + e.message);
+        }
+    }
+
+    $("form").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        stopPoll();
+        destroyHls();
+        $("video").removeAttribute("src");
+        $("video").load();
+        streamStarted = false;
+        $("streamUrl").textContent = "";
+        $("playerLink").style.display = "none";
+        $("log").textContent = "";
+
+        const fd = new FormData();
+        fd.append("prompt", $("prompt").value.trim());
+        fd.append("segment_duration", $("segment_duration").value || "3");
+        fd.append("max_chunks", $("max_chunks").value || "10");
+        const w = $("width").value, h = $("height").value;
+        if (w) fd.append("width", w);
+        if (h) fd.append("height", h);
+        const file = $("image").files[0];
+        if (file) fd.append("image", file);
+
+        $("btnSubmit").disabled = true;
+        setStatus("submitting");
+        log("提交任务中...");
+
+        try {
+            const r = await fetch(BASE + "/api/v1/tasks", { method: "POST", body: fd });
+            const j = await r.json();
+            if (!r.ok) throw new Error(j.detail || JSON.stringify(j));
+            currentTaskId = j.task_id;
+            $("taskId").textContent = currentTaskId;
+            setStatus(j.status || "pending");
+            log("已创建 task_id=" + currentTaskId);
+            $("btnStop").disabled = false;
+            $("btnSubmit").disabled = false;
+            pollTimer = setInterval(pollOnce, 2000);
+            pollOnce();
+        } catch (err) {
+            log("提交失败: " + err.message);
+            setStatus("failed");
+            $("btnSubmit").disabled = false;
+        }
+    });
+
+    $("btnStop").addEventListener("click", () => {
+        stopPoll();
+        log("已停止轮询（生成仍可能在服务端继续）");
+    });
+</script>
+</body>
+</html>

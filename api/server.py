@@ -22,9 +22,8 @@ from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from omegaconf import OmegaConf
 from PIL import Image
 import argparse
 
@@ -42,6 +41,8 @@ logger = setup_logger("api")
 # 全局
 # ---------------------------------------------------------------------------
 CFG_PATH = ROOT / "configs" / "default.yaml"
+
+
 def _parse_startup_args():
     """uvicorn 直接加载模块时也能从环境变量读；python -m api.server 时用 CLI。"""
     parser = argparse.ArgumentParser(add_help=False)
@@ -67,6 +68,7 @@ cfg = resolve_model_paths(cfg, model_root=_startup.model_root or None)
 
 # 可选：打印确认
 import logging
+
 logging.getLogger("api").info(
     "model.checkpoint=%s text_encoder=%s spatial_upsampler=%s",
     cfg.model.get("checkpoint"),
@@ -107,6 +109,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 挂载首页
+STATIC_DIR = ROOT / "static"
+STATIC_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@app.get("/")
+@app.get("/ui")
+def console_index():
+    index = STATIC_DIR / "index.html"
+    if not index.exists():
+        raise HTTPException(404, "static/index.html not found")
+    return FileResponse(index, media_type="text/html; charset=utf-8")
+
+
+# 可选：静态资源目录（以后放 css/js）
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
 # 静态挂载 HLS 目录（playlist + ts）
 app.mount("/streams", StaticFiles(directory=str(STREAMS_ROOT)), name="streams")
 
@@ -137,13 +156,13 @@ def on_shutdown():
 # ---------------------------------------------------------------------------
 @app.post("/api/v1/tasks")
 async def submit_task(
-    request: Request,
-    prompt: str = Form(..., description="生成提示词"),
-    image: Optional[UploadFile] = File(None, description="可选初始图片（I2V）"),
-    segment_duration: float = Form(3.0, description="每个 HLS 分片时长（秒）"),
-    max_chunks: int = Form(20, description="最多生成多少个分片"),
-    width: Optional[int] = Form(None),
-    height: Optional[int] = Form(None),
+        request: Request,
+        prompt: str = Form(..., description="生成提示词"),
+        image: Optional[UploadFile] = File(None, description="可选初始图片（I2V）"),
+        segment_duration: float = Form(3.0, description="每个 HLS 分片时长（秒）"),
+        max_chunks: int = Form(20, description="最多生成多少个分片"),
+        width: Optional[int] = Form(None),
+        height: Optional[int] = Form(None),
 ):
     """
     提交生成任务。
@@ -253,68 +272,13 @@ def get_stream_info(task_id: str, request: Request):
 # ---------------------------------------------------------------------------
 # 简易播放页（浏览器打开即可播 m3u8）
 # ---------------------------------------------------------------------------
-@app.get("/player/{task_id}", response_class=HTMLResponse)
-def player_page(task_id: str, request: Request):
-    info = task_manager.get(task_id)
-    if not info:
-        raise HTTPException(404, "task not found")
-    base = _base_url(request)
-    stream = f"{base}/streams/{task_id}/playlist.m3u8"
-    html = f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>LTX Stream — {task_id}</title>
-  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.7/dist/hls.min.js"></script>
-  <style>
-    body {{ margin:0; background:#111; color:#eee; font-family:system-ui,sans-serif; }}
-    .wrap {{ max-width:960px; margin:24px auto; padding:0 12px; }}
-    video {{ width:100%; background:#000; border-radius:8px; }}
-    .meta {{ margin-top:12px; font-size:14px; opacity:0.85; }}
-    code {{ background:#222; padding:2px 6px; border-radius:4px; }}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <h2>LTX Streaming Player</h2>
-    <video id="v" controls autoplay muted playsinline></video>
-    <div class="meta">
-      <div>Task: <code>{task_id}</code></div>
-      <div>Status: <code id="st">{info.status.value}</code></div>
-      <div>Stream: <code>{stream}</code></div>
-    </div>
-  </div>
-  <script>
-    const src = "{stream}";
-    const video = document.getElementById("v");
-    function start() {{
-      if (Hls.isSupported()) {{
-        const hls = new Hls({{ enableWorker: true, lowLatencyMode: true }});
-        hls.loadSource(src);
-        hls.attachMedia(video);
-        hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(()=>{{}}));
-        hls.on(Hls.Events.ERROR, (_, data) => {{
-          if (data.fatal) setTimeout(() => {{ hls.loadSource(src); }}, 2000);
-        }});
-      }} else if (video.canPlayType("application/vnd.apple.mpegurl")) {{
-        video.src = src;
-        video.addEventListener("loadedmetadata", () => video.play().catch(()=>{{}}));
-      }}
-    }}
-    start();
-    // 简单轮询状态
-    setInterval(async () => {{
-      try {{
-        const r = await fetch("{base}/api/v1/tasks/{task_id}");
-        const j = await r.json();
-        document.getElementById("st").textContent = j.status;
-      }} catch(e) {{}}
-    }}, 3000);
-  </script>
-</body>
-</html>"""
-    return HTMLResponse(html)
+@app.get("/player/{task_id}")
+def player_page(task_id: str):
+    """静态播放页；task_id 由前端从 URL 解析。"""
+    path = STATIC_DIR / "player.html"
+    if not path.exists():
+        raise HTTPException(404, "static/player.html not found")
+    return FileResponse(path, media_type="text/html; charset=utf-8")
 
 
 @app.get("/health")
