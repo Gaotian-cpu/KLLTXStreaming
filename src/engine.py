@@ -7,6 +7,7 @@ from typing import Any, List, Optional
 import torch
 from omegaconf import OmegaConf
 from PIL import Image
+import numpy as np
 
 from .hls.writer import HLSWriter
 from .lora_manager import LoRAManager
@@ -196,7 +197,17 @@ class StreamingEngine:
             # 必须在同一上下文里把 iterator 消费完，再转成 CPU/PIL
             frames = self._tensors_to_pil_frames(video_iter)
 
-        return frames
+            # audio.waveform: Tensor，常见 [C, T] 或 [T]
+            # audio.sampling_rate: int，多为 24000
+            wav = audio.waveform.detach().float().cpu().numpy()
+            if wav.ndim == 1:
+                wav = wav[np.newaxis, :]
+            elif wav.ndim == 2 and wav.shape[0] > wav.shape[1]:
+                # 若实际是 [T, C]，改成 [C, T]
+                wav = wav.T
+            sample_rate = int(audio.sampling_rate)
+
+        return frames, wav, sample_rate
 
     def _tensors_to_pil_frames(self, video_iter) -> list:
         """把官方 decode 的 iterator 收成 PIL 列表。"""
@@ -272,7 +283,7 @@ class StreamingEngine:
                     continue
 
                 # 生成当前 chunk
-                frames = self._generate_chunk(
+                frames, audio_np, sr = self._generate_chunk(
                     prompt=prompt,
                     condition_image=condition,
                 )
@@ -383,7 +394,7 @@ class StreamingEngine:
                 if i == 0:
                     current_prompt = prompt
 
-                frames = self._generate_chunk(
+                frames, audio_np, sr = self._generate_chunk(
                     prompt=current_prompt,
                     condition_image=condition,
                     num_frames=chunk_frames,
@@ -391,7 +402,7 @@ class StreamingEngine:
                 if not frames:
                     continue
 
-                seg = hls.add_frames(frames)
+                seg = hls.add_frames(frames, audio_np=audio_np, sample_rate=sr)
                 self._chunk_count += 1
                 progress = min(1.0, self._chunk_count / max(max_chunks, 1))
 

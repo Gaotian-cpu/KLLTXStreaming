@@ -51,7 +51,9 @@ class HLSWriter:
     def segment_count(self) -> int:
         return self._segment_index
 
-    def add_frames(self, frames: List[Image.Image]) -> Optional[Path]:
+    def add_frames(self, frames: List[Image.Image],
+                   audio_np: Optional["np.ndarray"] = None,  # shape [C, T] float32，约 [-1, 1]
+                   sample_rate: int = 24000,) -> Optional[Path]:
         """
         把一帧序列写成一个 .ts 分片，并更新 m3u8。
         返回新分片路径；若失败返回 None。
@@ -59,12 +61,16 @@ class HLSWriter:
         if not frames or self._finished:
             return None
 
-        # 实际时长按帧数计算
         duration = len(frames) / max(self.fps, 1)
         seg_name = f"{self.segment_prefix}_{self._segment_index:05d}.ts"
         seg_path = self.output_dir / seg_name
 
-        ok = self._encode_ts(frames, seg_path)
+        ok = self._encode_ts(
+            frames,
+            seg_path,
+            audio_np=audio_np,
+            sample_rate=sample_rate,
+        )
         if not ok:
             return None
 
@@ -101,60 +107,94 @@ class HLSWriter:
         tmp.write_text(content, encoding="utf-8")
         tmp.replace(self.playlist_path)
 
-    def _encode_ts(self, frames: List[Image.Image], out_path: Path) -> bool:
-        """
-        用 ffmpeg 把帧序列编码成 MPEG-TS。
-        优先走管道，避免大量临时文件。
-        """
-        if not frames:
-            return False
+    def _encode_ts(
+            self,
+            frames: List[Image.Image],
+            seg_path: Path,
+            audio_np: Optional[np.ndarray] = None,
+            sample_rate: int = 24000,
+    ) -> bool:
+        """将 frames（+ 可选音频）编码为 MPEG-TS。"""
+        import subprocess
+        import tempfile
+        import shutil
 
-        w, h = frames[0].size
-        # 保证偶数分辨率（H.264 要求）
-        w = w - (w % 2)
-        h = h - (h % 2)
-
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-f", "rawvideo",
-            "-vcodec", "rawvideo",
-            "-pix_fmt", "rgb24",
-            "-s", f"{w}x{h}",
-            "-r", str(self.fps),
-            "-i", "-",
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-tune", "zerolatency",
-            "-pix_fmt", "yuv420p",
-            "-g", str(max(1, int(self.fps * self.segment_duration))),  # keyframe 间隔 ≈ 分片时长
-            "-f", "mpegts",
-            str(out_path),
-        ]
-
+        work = Path(tempfile.mkdtemp(prefix="hls_seg_"))
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-            assert proc.stdin is not None
-            for img in frames:
-                if img.size != (w, h):
-                    img = img.resize((w, h), Image.Resampling.LANCZOS)
-                arr = np.asarray(img.convert("RGB"), dtype=np.uint8)
-                proc.stdin.write(arr.tobytes())
-            proc.stdin.close()
-            ret = proc.wait(timeout=120)
-            if ret != 0:
-                err = proc.stderr.read().decode("utf-8", errors="ignore")[-500:]
-                logger.error(f"ffmpeg failed (code={ret}): {err}")
+            # 1) 写 PNG 序列
+            for i, im in enumerate(frames):
+                im.convert("RGB").save(work / f"frame_{i:05d}.png")
+
+            cmd = [
+                "ffmpeg", "-y",
+                "-hide_banner", "-loglevel", "error",
+                "-framerate", str(self.fps),
+                "-i", str(work / "frame_%05d.png"),
+            ]
+
+            # 2) 可选音频：写成临时 wav 再接上
+            wav_path = None
+            if audio_np is not None and audio_np.size > 0:
+                wav_path = work / "audio.wav"
+                self._write_wav(wav_path, audio_np, sample_rate)
+                cmd += ["-i", str(wav_path)]
+
+            cmd += [
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-preset", "veryfast",
+                "-g", str(max(self.fps, 1)),          # 关键帧间隔约 1s，便于 HLS
+                "-sc_threshold", "0",
+            ]
+
+            if wav_path is not None:
+                cmd += [
+                    "-c:a", "aac",
+                    "-b:a", "128k",
+                    "-ar", "48000",                    # 播放端常见采样率；也可保持 sample_rate
+                    "-ac", "2",
+                    "-shortest",                      # 以较短的一路为准，避免尾部空音/空画
+                ]
+            else:
+                cmd += ["-an"]
+
+            cmd += [
+                "-f", "mpegts",
+                str(seg_path),
+            ]
+
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                logger.error("ffmpeg failed: %s", r.stderr[-2000:] if r.stderr else "")
                 return False
-            return out_path.exists() and out_path.stat().st_size > 0
-        except FileNotFoundError:
-            logger.error("ffmpeg not found. Please install ffmpeg.")
-            return False
+            return seg_path.is_file() and seg_path.stat().st_size > 0
         except Exception as e:
-            logger.error(f"encode_ts error: {e}")
+            logger.exception("encode_ts error: %s", e)
             return False
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    def _write_wav(self, path: Path, audio_np: np.ndarray, sample_rate: int) -> None:
+        """audio_np: [C, T] 或 [T]，float，优先按 [-1,1] 解释。"""
+        import wave
+
+        x = np.asarray(audio_np, dtype=np.float32)
+        if x.ndim == 1:
+            x = x[np.newaxis, :]          # [1, T]
+        if x.ndim != 2:
+            raise ValueError(f"audio_np shape invalid: {x.shape}")
+
+        # [C, T] → [T, C]
+        x = np.transpose(x, (1, 0))
+        peak = float(np.max(np.abs(x))) if x.size else 0.0
+        if peak > 1.5:                    # 已是较大数值时做简单归一
+            x = x / peak
+        x = np.clip(x, -1.0, 1.0)
+        pcm = (x * 32767.0).astype(np.int16)
+        channels = pcm.shape[1]
+
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(channels)
+            wf.setsampwidth(2)
+            wf.setframerate(int(sample_rate))
+            wf.writeframes(pcm.tobytes())
