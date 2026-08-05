@@ -73,6 +73,18 @@ class StreamingEngine:
         )
         dtype = getattr(torch, self.cfg.model.dtype, torch.bfloat16)
 
+        ckpt = self.cfg.model.get("checkpoint")
+        spatial = self.cfg.model.get("spatial_upsampler")
+        text_encoder = self.cfg.model.get("text_encoder")
+
+        if not ckpt:
+            raise RuntimeError("cfg.model.checkpoint 为空，请检查配置与 --model-root")
+
+        if spatial:
+            logger.info(f"spatial_upsampler={spatial}")
+        if text_encoder:
+            logger.info(f"text_encoder(file)={text_encoder}")
+
         # ---- 尝试官方 LTX-2 DistilledPipeline ----
         try:
             from ltx_pipelines import DistilledPipeline  # type: ignore
@@ -86,7 +98,7 @@ class StreamingEngine:
 
             # 实际参数名请对照你安装的 LTX-2 版本
             self.pipeline = DistilledPipeline.from_pretrained(
-                self.cfg.model.checkpoint,
+                ckpt,
                 **kwargs,
             )
             if device_map is None:

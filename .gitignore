@@ -223,7 +223,7 @@ __marimo__/
 .idea/
 
 # vendor
-vendor/LTX-2/
+#vendor/LTX-2/
 
 # coding
 api/__pycache__/

@@ -25,11 +25,12 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from omegaconf import OmegaConf
 from PIL import Image
+import argparse
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.config import load_config
+from src.config import load_config, resolve_model_paths
 from src.engine import StreamingEngine
 from src.task_manager import TaskManager, TaskStatus
 from src.utils import setup_logger
@@ -40,7 +41,37 @@ logger = setup_logger("api")
 # 全局
 # ---------------------------------------------------------------------------
 CFG_PATH = ROOT / "configs" / "default.yaml"
-cfg = load_config(CFG_PATH)
+def _parse_startup_args():
+    """uvicorn 直接加载模块时也能从环境变量读；python -m api.server 时用 CLI。"""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--model-root",
+        type=str,
+        default=os.environ.get("LTX_MODEL_ROOT", ""),
+        help="模型文件根目录，与 yaml 中相对路径拼接",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=str(CFG_PATH),
+        help="配置文件路径",
+    )
+    args, _ = parser.parse_known_args()
+    return args
+
+
+_startup = _parse_startup_args()
+cfg = load_config(_startup.config)
+cfg = resolve_model_paths(cfg, model_root=_startup.model_root or None)
+
+# 可选：打印确认
+import logging
+logging.getLogger("api").info(
+    "model.checkpoint=%s text_encoder=%s spatial_upsampler=%s",
+    cfg.model.get("checkpoint"),
+    cfg.model.get("text_encoder"),
+    cfg.model.get("spatial_upsampler"),
+)
 
 STREAMS_ROOT = Path(cfg.streaming.get("output_dir", "outputs")) / "streams"
 STREAMS_ROOT.mkdir(parents=True, exist_ok=True)
@@ -295,6 +326,12 @@ def health():
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
+
+    # 再解析一次，保证 --model-root 生效（模块 import 时已处理过一遍也可）
+    startup = _parse_startup_args()
+    # cfg 已在模块级 resolve；若希望严格以 CLI 为准，可再 resolve 一次：
+    # global cfg
+    # cfg = resolve_model_paths(load_config(startup.config), startup.model_root or None)
 
     host = cfg.get("server", {}).get("host", "0.0.0.0")
     port = int(cfg.get("server", {}).get("port", 8000))

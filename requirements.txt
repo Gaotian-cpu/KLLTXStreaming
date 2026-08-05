@@ -18,6 +18,7 @@ einops
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
 python-multipart
+ffmpeg-python
 # 官方 LTX-2 请单独安装：
 # git clone https://github.com/Lightricks/LTX-2.git && cd LTX-2 && pip install -e .
 # 系统还需安装 ffmpeg（用于把帧编码成 HLS .ts 分片）
