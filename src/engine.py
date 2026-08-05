@@ -62,158 +62,150 @@ class StreamingEngine:
     # Pipeline 加载（适配层）
     # ------------------------------------------------------------------
     def _load_pipeline(self) -> None:
-        """
-        优先尝试官方 ltx_pipelines.DistilledPipeline，
-        失败则回退到 Diffusers LTXPipeline / LTXImageToVideoPipeline。
-        你可以根据实际安装的版本修改这里。
-        """
-        device_map = resolve_device_map(
-            strategy=self.cfg.multi_gpu.strategy,
-            device_map=self.cfg.multi_gpu.device_map,
-        )
-        dtype = getattr(torch, self.cfg.model.dtype, torch.bfloat16)
+        from pathlib import Path
+        import torch
+        from ltx_pipelines.distilled import DistilledPipeline
 
         ckpt = self.cfg.model.get("checkpoint")
         spatial = self.cfg.model.get("spatial_upsampler")
-        text_encoder = self.cfg.model.get("text_encoder")
+        gemma_root = (
+                self.cfg.model.get("text_encoder_root")
+                or self.cfg.model.get("gemma_root")
+        )
 
-        if not ckpt:
-            raise RuntimeError("cfg.model.checkpoint 为空，请检查配置与 --model-root")
-
-        if spatial:
-            logger.info(f"spatial_upsampler={spatial}")
-        if text_encoder:
-            logger.info(f"text_encoder(file)={text_encoder}")
-
-        # ---- 尝试官方 LTX-2 DistilledPipeline ----
-        try:
-            from ltx_pipelines import DistilledPipeline  # type: ignore
-
-            logger.info("Loading official DistilledPipeline...")
-            kwargs = {
-                "torch_dtype": dtype,
-            }
-            if device_map is not None:
-                kwargs["device_map"] = device_map
-
-            # 实际参数名请对照你安装的 LTX-2 版本
-            self.pipeline = DistilledPipeline.from_pretrained(
-                ckpt,
-                **kwargs,
+        if not ckpt or not Path(ckpt).is_file():
+            raise FileNotFoundError(f"checkpoint 不是有效文件: {ckpt}")
+        if not spatial or not Path(spatial).is_file():
+            raise FileNotFoundError(f"spatial_upsampler 不是有效文件: {spatial}")
+        if not gemma_root or not Path(gemma_root).is_dir():
+            raise FileNotFoundError(
+                f"gemma_root 必须是目录（官方 PromptEncoder 需要）: {gemma_root}"
             )
-            if device_map is None:
-                self.pipeline.to(self.device)
-            logger.info("Official DistilledPipeline loaded.")
-        except Exception as e:
-            logger.warning(f"Official DistilledPipeline not available ({e}), trying Diffusers...")
-            self._load_diffusers_fallback(dtype, device_map)
 
+        logger.info(
+            "Loading DistilledPipeline ckpt=%s spatial=%s gemma_root=%s",
+            ckpt, spatial, gemma_root,
+        )
+
+        self.pipeline = DistilledPipeline(
+            distilled_checkpoint_path=str(ckpt),
+            gemma_root=str(gemma_root),
+            spatial_upsampler_path=str(spatial),
+            loras=(),           # Fixme 后续增加
+            device=self.device if str(self.device).startswith("cuda") else None,
+        )
         self.lora_mgr.attach_pipeline(self.pipeline)
+        logger.info("DistilledPipeline loaded.")
 
-        # 初始 LoRA
-        if self.cfg.lora.initial:
-            self.lora_mgr.request_load(self.cfg.lora.initial, self.cfg.lora.scale)
-            self.lora_mgr.apply_if_needed()
-
-    def _load_diffusers_fallback(self, dtype, device_map) -> None:
-        try:
-            from diffusers import LTXPipeline, LTXImageToVideoPipeline  # type: ignore
-
-            # 根据你下载的权重选择
-            model_id = self.cfg.model.checkpoint
-            logger.info(f"Loading Diffusers pipeline from {model_id}")
-            try:
-                self.pipeline = LTXImageToVideoPipeline.from_pretrained(
-                    model_id,
-                    torch_dtype=dtype,
-                    device_map=device_map,
-                )
-            except Exception:
-                self.pipeline = LTXPipeline.from_pretrained(
-                    model_id,
-                    torch_dtype=dtype,
-                    device_map=device_map,
-                )
-            if device_map is None:
-                self.pipeline.to(self.device)
-            logger.info("Diffusers LTX pipeline loaded.")
-        except Exception as e:
-            logger.error(f"Failed to load any LTX pipeline: {e}")
-            raise RuntimeError(
-                "无法加载 LTX 模型。请确认已安装官方 LTX-2 或 Diffusers，并正确配置 checkpoint 路径。"
-            ) from e
+    # def _load_diffusers_fallback(self, dtype, device_map) -> None:
+    #     try:
+    #         from diffusers import LTXPipeline, LTXImageToVideoPipeline  # type: ignore
+    #
+    #         # 根据你下载的权重选择
+    #         model_id = self.cfg.model.checkpoint
+    #         logger.info(f"Loading Diffusers pipeline from {model_id}")
+    #         try:
+    #             self.pipeline = LTXImageToVideoPipeline.from_pretrained(
+    #                 model_id,
+    #                 torch_dtype=dtype,
+    #                 device_map=device_map,
+    #             )
+    #         except Exception:
+    #             self.pipeline = LTXPipeline.from_pretrained(
+    #                 model_id,
+    #                 torch_dtype=dtype,
+    #                 device_map=device_map,
+    #             )
+    #         if device_map is None:
+    #             self.pipeline.to(self.device)
+    #         logger.info("Diffusers LTX pipeline loaded.")
+    #     except Exception as e:
+    #         logger.error(f"Failed to load any LTX pipeline: {e}")
+    #         raise RuntimeError(
+    #             "无法加载 LTX 模型。请确认已安装官方 LTX-2 或 Diffusers，并正确配置 checkpoint 路径。"
+    #         ) from e
 
     # ------------------------------------------------------------------
     # 单个 Chunk 生成
     # ------------------------------------------------------------------
     def _generate_chunk(
-        self,
-        prompt: str,
-        condition_image: Optional[Image.Image] = None,
-        num_frames: Optional[int] = None,
-    ) -> List[Image.Image]:
-        """
-        调用底层 pipeline 生成一个 chunk。
-        这里做了兼容处理，实际参数名请按你的 LTX 版本微调。
-        """
+            self,
+            prompt: str,
+            condition_image=None,  # PIL.Image 或 None
+            num_frames: int | None = None,
+    ):
+        from pathlib import Path
+        import tempfile
+        import torch
+        from ltx_pipelines.utils.args import ImageConditioningInput  # 确认实际字段名
+
         num_frames = num_frames or int(self.cfg.generation.chunk_frames)
         width = int(self.cfg.generation.width)
         height = int(self.cfg.generation.height)
-        steps = int(self.cfg.generation.num_inference_steps)
-        guidance = float(self.cfg.generation.guidance_scale)
-        neg = self.cfg.generation.negative_prompt
+        fps = float(self.cfg.generation.fps)
+        seed = int(self.cfg.generation.seed) + self._chunk_count
 
-        # 动态 LoRA 在 chunk 边界生效
+        # 官方: images: list[ImageConditioningInput]
+        images = []
+        if condition_image is not None:
+            # ImageConditioningInput 的构造以你包内定义为准，常见是路径+起始帧
+            # 先查: python -c "from ltx_pipelines.utils.args import ImageConditioningInput; import typing; print(ImageConditioningInput)"
+            tmp = Path(tempfile.gettempdir()) / f"ltx_cond_{self._chunk_count}.png"
+            condition_image.save(tmp)
+            try:
+                # 尝试常见形态（按你 inspect 结果改成正确的一种）
+                images = [ImageConditioningInput(path=str(tmp), frame_idx=0)]
+            except TypeError:
+                images = [ImageConditioningInput(str(tmp), 0)]
+
         self.lora_mgr.apply_if_needed()
 
-        kwargs = {
-            "prompt": prompt,
-            "negative_prompt": neg,
-            "width": width,
-            "height": height,
-            "num_frames": num_frames,
-            "num_inference_steps": steps,
-            "guidance_scale": guidance,
-        }
-
-        # 续写条件
-        if condition_image is not None:
-            # 不同 pipeline 参数名可能是 image / conditioning_image / first_frame 等
-            if hasattr(self.pipeline, "__call__"):
-                # 尝试常见参数
-                for key in ("image", "conditioning_image", "first_frame", "condition_image"):
-                    kwargs[key] = condition_image
-                    break
-
-        t0 = time.time()
-        try:
-            with torch.inference_mode():
-                output = self.pipeline(**kwargs)
-        except TypeError:
-            # 参数名不匹配时的兜底：去掉 image 相关再试
-            kwargs.pop("image", None)
-            kwargs.pop("conditioning_image", None)
-            kwargs.pop("first_frame", None)
-            kwargs.pop("condition_image", None)
-            with torch.inference_mode():
-                output = self.pipeline(**kwargs)
-
-        # 解析输出
-        if hasattr(output, "frames"):
-            frames = output.frames
-            if isinstance(frames, list) and len(frames) > 0 and isinstance(frames[0], list):
-                frames = frames[0]
-        elif hasattr(output, "images"):
-            frames = output.images
-        else:
-            frames = output
-
-        frames = frames_to_pil(frames)
-        elapsed = time.time() - t0
-        logger.info(
-            f"Chunk {self._chunk_count} generated: {len(frames)} frames, "
-            f"{elapsed:.2f}s ({len(frames)/max(elapsed,1e-3):.1f} fps)"
+        video_iter, audio = self.pipeline(
+            prompt=prompt,
+            seed=seed,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            frame_rate=fps,
+            images=images,
+            enhance_prompt=False,
         )
+
+        # video_iter 是 Iterator[torch.Tensor]，需要收成帧列表
+        frames = self._tensors_to_pil_frames(video_iter)
+        return frames
+
+    def _tensors_to_pil_frames(self, video_iter) -> list:
+        """把官方 decode 的 iterator 收成 PIL 列表。"""
+        import numpy as np
+        from PIL import Image
+        import torch
+
+        frames = []
+        for chunk in video_iter:
+            # chunk 形状因版本而异，常见 [T,C,H,W] 或 [B,T,C,H,W] 或 [C,H,W]
+            t = chunk.detach().float().cpu()
+            if t.ndim == 5:
+                t = t[0]
+            if t.ndim == 3:
+                t = t.unsqueeze(0)
+            # 期望 T,C,H,W
+            if t.shape[1] in (1, 3) or t.shape[1] > 4:
+                pass
+            elif t.shape[-1] in (1, 3):
+                t = t.permute(0, 3, 1, 2)
+            for i in range(t.shape[0]):
+                f = t[i]
+                if f.shape[0] in (1, 3):
+                    f = f.permute(1, 2, 0)
+                f = f.numpy()
+                if f.max() <= 1.5:
+                    f = (f * 255.0).clip(0, 255).astype(np.uint8)
+                else:
+                    f = f.clip(0, 255).astype(np.uint8)
+                if f.shape[-1] == 1:
+                    f = np.repeat(f, 3, axis=-1)
+                frames.append(Image.fromarray(f[..., :3]))
         return frames
 
     # ------------------------------------------------------------------
