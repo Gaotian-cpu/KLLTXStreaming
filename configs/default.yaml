@@ -1,0 +1,71 @@
+# LTX Streaming Interactive 默认配置
+# 针对 H100 / H200 + 蒸馏模型优化
+
+model:
+  # 使用官方蒸馏模型路径（请改成你实际路径）
+  checkpoint: "models/ltx-2.3/ltx-2.3-22b-distilled-1.1.safetensors"
+  # 可选：空间超分
+  spatial_upsampler: null   # "models/ltx-2.3/ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+  # text encoder / gemma 路径（按官方要求）
+  text_encoder_root: "models/gemma-3-12b"
+  dtype: "bfloat16"
+  # 是否优先使用蒸馏 pipeline
+  use_distilled: true
+
+generation:
+  width: 960
+  height: 544
+  fps: 24
+  # 每个 chunk 的帧数（越小响应越快，越大越连贯）
+  chunk_frames: 72          # 3 秒 @ 24fps
+  # 续写时使用上一块最后多少帧作为条件
+  overlap_frames: 8
+  num_inference_steps: 8    # 蒸馏模型推荐低步数
+  guidance_scale: 1.0       # 蒸馏通常不需要高 CFG
+  seed: 42
+  # 负向提示词
+  negative_prompt: "blurry, low quality, distorted face, jittery, bad anatomy, watermark"
+
+streaming:
+  # 输出方式: "file" | "queue" | "websocket"
+  mode: "file"
+  output_dir: "outputs"
+  # 是否边生成边写临时 mp4
+  progressive_save: true
+  # websocket 配置（mode=websocket 时生效）
+  ws_host: "0.0.0.0"
+  ws_port: 8765
+
+lora:
+  # 启动时加载的 LoRA（可选）
+  initial: null
+  # LoRA 强度
+  scale: 0.8
+
+multi_gpu:
+  # "auto" | "single" | "ddp"
+  strategy: "auto"
+  # device_map 相关
+  device_map: "auto"
+  offload: null             # null | "cpu" | "disk"
+
+runtime:
+  # 最大连续生成 chunk 数（防止无限跑）
+  max_chunks: 60
+  # 提示词队列最大长度
+  prompt_queue_size: 8
+  log_level: "INFO"
+
+# HTTP 服务配置
+server:
+  host: "0.0.0.0"
+  port: 8000
+  # 对外访问的根地址（留空则自动从请求推断）
+  # 例如: "https://your-domain.com" 或 "http://10.0.0.5:8000"
+  public_base: ""
+  # 同时跑几个生成任务（H100/H200 显存大可适当加大）
+  max_workers: 1
+
+# HLS 默认分片时长（秒），提交任务时可覆盖
+hls:
+  segment_duration: 3.0

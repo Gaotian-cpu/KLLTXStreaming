@@ -1,0 +1,23 @@
+torch>=2.4.0
+torchaudio
+torchvision
+accelerate>=0.33.0
+transformers>=4.44.0
+diffusers>=0.30.0
+safetensors
+omegaconf
+pyyaml
+numpy
+pillow
+av
+imageio
+imageio-ffmpeg
+tqdm
+rich
+einops
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart
+# 官方 LTX-2 请单独安装：
+# git clone https://github.com/Lightricks/LTX-2.git && cd LTX-2 && pip install -e .
+# 系统还需安装 ffmpeg（用于把帧编码成 HLS .ts 分片）
