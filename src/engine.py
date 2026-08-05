@@ -94,11 +94,24 @@ class StreamingEngine:
             distilled_checkpoint_path=str(ckpt),
             gemma_root=str(gemma_root),
             spatial_upsampler_path=str(spatial),
-            loras=(),       # Fixme 增加lora
+            loras=(),  # Fixme 增加lora
             device=self.device if str(self.device).startswith("cuda") else None,
             offload_mode=OffloadMode.CPU,
             quantization=quant,
         )
+
+        # 推理不需要梯度
+        def _disable_grad(module):
+            if module is None:
+                return
+            if hasattr(module, "eval"):
+                module.eval()
+            for p in getattr(module, "parameters", lambda: [])():
+                p.requires_grad_(False)
+
+        for name in ("prompt_encoder", "image_conditioner", "stage", "upsampler", "video_decoder", "audio_decoder"):
+            _disable_grad(getattr(self.pipeline, name, None))
+
         self.lora_mgr.attach_pipeline(self.pipeline)
         logger.info("DistilledPipeline loaded.")
 
@@ -165,19 +178,20 @@ class StreamingEngine:
 
         self.lora_mgr.apply_if_needed()
 
-        video_iter, audio = self.pipeline(
-            prompt=prompt,
-            seed=seed,
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            frame_rate=fps,
-            images=images,
-            enhance_prompt=False,
-        )
+        with torch.inference_mode():
+            video_iter, audio = self.pipeline(
+                prompt=prompt,
+                seed=seed,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                frame_rate=fps,
+                images=images,
+                enhance_prompt=False,
+            )
+            # 必须在同一上下文里把 iterator 消费完，再转成 CPU/PIL
+            frames = self._tensors_to_pil_frames(video_iter)
 
-        # video_iter 是 Iterator[torch.Tensor]，需要收成帧列表
-        frames = self._tensors_to_pil_frames(video_iter)
         return frames
 
     def _tensors_to_pil_frames(self, video_iter) -> list:
@@ -217,10 +231,10 @@ class StreamingEngine:
     # 主循环：流式生成
     # ------------------------------------------------------------------
     def run(
-        self,
-        initial_prompt: str,
-        initial_image: Optional[Image.Image] = None,
-        max_chunks: Optional[int] = None,
+            self,
+            initial_prompt: str,
+            initial_image: Optional[Image.Image] = None,
+            max_chunks: Optional[int] = None,
     ) -> Path:
         """
         开始流式生成。
