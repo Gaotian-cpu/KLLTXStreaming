@@ -166,15 +166,19 @@ class StreamingEngine:
         # 官方: images: list[ImageConditioningInput]
         images = []
         if condition_image is not None:
-            # ImageConditioningInput 的构造以你包内定义为准，常见是路径+起始帧
-            # 先查: python -c "from ltx_pipelines.utils.args import ImageConditioningInput; import typing; print(ImageConditioningInput)"
             tmp = Path(tempfile.gettempdir()) / f"ltx_cond_{self._chunk_count}.png"
             condition_image.save(tmp)
+            # 常见签名: (path, frame_idx, strength)
+            # strength=1.0 强约束首帧；续写 chunk 可略降到 0.8～0.9，运动更自然
+            strength = 1.0 if self._chunk_count == 0 else 0.85
             try:
-                # 尝试常见形态（按你 inspect 结果改成正确的一种）
-                images = [ImageConditioningInput(path=str(tmp), frame_idx=0)]
+                images = [ImageConditioningInput(path=str(tmp), frame_idx=0, strength=strength)]
             except TypeError:
-                images = [ImageConditioningInput(str(tmp), 0)]
+                try:
+                    images = [ImageConditioningInput(str(tmp), 0, strength)]
+                except TypeError:
+                    # 若字段名不同，用下面命令看真实定义后再改
+                    images = [ImageConditioningInput(str(tmp), 0, strength)]
 
         self.lora_mgr.apply_if_needed()
 
