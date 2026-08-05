@@ -63,9 +63,9 @@ class StreamingEngine:
     # ------------------------------------------------------------------
     def _load_pipeline(self) -> None:
         from pathlib import Path
-        from ltx_core.quantization import QuantizationPolicy
+        from ltx_core.quantization.fp8_cast import build_policy as build_fp8_cast_policy
         from ltx_pipelines.distilled import DistilledPipeline
-        from ltx_pipelines.utils.types import OffloadMode  # 可选，一起省显存
+        from ltx_pipelines.utils.types import OffloadMode
 
         ckpt = self.cfg.model.get("checkpoint")
         spatial = self.cfg.model.get("spatial_upsampler")
@@ -88,22 +88,16 @@ class StreamingEngine:
             ckpt, spatial, gemma_root,
         )
 
-        # 1) FP8 Cast：配合 **bf16 原版** checkpoint（你现在的 distilled-1.1.safetensors）
-        # 加载时把 transformer 权重降到 FP8，推理时再升上去
-        quant = QuantizationPolicy.fp8_cast()
-
-        # 2) FP8 Scaled MM：更适合 Hopper（H100）+ **FP8 专用权重**
-        # quant = QuantizationPolicy.fp8_scaled_mm()
-        # 若需要校准文件：
-        # quant = QuantizationPolicy.fp8_scaled_mm(calibration_amax_path="/path/to/amax.json")
+        quant = build_fp8_cast_policy(str(ckpt))
 
         self.pipeline = DistilledPipeline(
             distilled_checkpoint_path=str(ckpt),
             gemma_root=str(gemma_root),
             spatial_upsampler_path=str(spatial),
-            loras=(),           # Fixme 后续增加
+            loras=(),       # Fixme 增加lora
             device=self.device if str(self.device).startswith("cuda") else None,
             offload_mode=OffloadMode.CPU,
+            quantization=quant,
         )
         self.lora_mgr.attach_pipeline(self.pipeline)
         logger.info("DistilledPipeline loaded.")
